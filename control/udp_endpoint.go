@@ -46,7 +46,7 @@ func (ue *UdpEndpoint) start() {
 		ue.deadlineTimer.Reset(ue.NatTimeout)
 		ue.mu.Unlock()
 		if err = ue.handler(buf[:n], from); err != nil {
-			if errors.Is(err, SuspectedRushAnswerError) {
+			if errors.Is(err, ErrSuspectedRushAnswer) {
 				continue
 			}
 			break

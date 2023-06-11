@@ -8,9 +8,7 @@ package control
 import (
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
-	"github.com/daeuniverse/dae/common"
 	"io"
 	"math"
 	"net"
@@ -18,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/daeuniverse/dae/common"
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/common/netutils"
@@ -46,13 +46,8 @@ const (
 )
 
 var (
-	SuspectedRushAnswerError     = fmt.Errorf("suspected DNS rush-answer")
-	UnsupportedQuestionTypeError = fmt.Errorf("unsupported question type")
-)
-
-var (
-	UnspecifiedAddressA    = netip.MustParseAddr("0.0.0.0")
-	UnspecifiedAddressAAAA = netip.MustParseAddr("::")
+	ErrSuspectedRushAnswer     = fmt.Errorf("suspected DNS rush-answer")
+	ErrUnsupportedQuestionType = fmt.Errorf("unsupported question type")
 )
 
 type DnsControllerOption struct {
@@ -179,98 +174,6 @@ func (c *DnsController) LookupDnsRespCache_(msg *dnsmessage.Message) (resp []byt
 	return nil
 }
 
-// DnsRespHandler handle DNS resp.
-func (c *DnsController) DnsRespHandler(data []byte, validateRushAns bool) (newMsg *dnsmessage.Message, err error) {
-	var msg dnsmessage.Message
-	if err = msg.Unpack(data); err != nil {
-		return nil, fmt.Errorf("unpack dns pkt: %w", err)
-	}
-	// Check healthy resp.
-	if !msg.Response || len(msg.Questions) == 0 {
-		return &msg, nil
-	}
-
-	q := msg.Questions[0]
-
-	// Check suc resp.
-	if msg.RCode != dnsmessage.RCodeSuccess {
-		return &msg, nil
-	}
-
-	// Get TTL.
-	var ttl uint32
-	for i := range msg.Answers {
-		if ttl == 0 {
-			ttl = msg.Answers[i].Header.TTL
-			break
-		}
-	}
-	if ttl == 0 {
-		// It seems no answers (NXDomain).
-		ttl = minFirefoxCacheTtl
-	}
-
-	// Check req type.
-	switch q.Type {
-	case dnsmessage.TypeA, dnsmessage.TypeAAAA:
-	default:
-		// Update DnsCache.
-		if err = c.updateDnsCache(&msg, ttl, &q); err != nil {
-			return nil, err
-		}
-		return &msg, nil
-	}
-
-	// Set ttl.
-	for i := range msg.Answers {
-		// Set TTL = zero. This requests applications must resend every request.
-		// However, it may be not defined in the standard.
-		msg.Answers[i].Header.TTL = 0
-	}
-
-	// Check if request A/AAAA record.
-	var reqIpRecord bool
-loop:
-	for i := range msg.Questions {
-		switch msg.Questions[i].Type {
-		case dnsmessage.TypeA, dnsmessage.TypeAAAA:
-			reqIpRecord = true
-			break loop
-		}
-	}
-	if !reqIpRecord {
-		// Update DnsCache.
-		if err = c.updateDnsCache(&msg, ttl, &q); err != nil {
-			return nil, err
-		}
-		return &msg, nil
-	}
-
-	if validateRushAns {
-		exist, e := EnsureAdditionalOpt(&msg, false)
-		if e != nil && !errors.Is(e, UnsupportedQuestionTypeError) {
-			c.log.Warnf("EnsureAdditionalOpt: %v", e)
-		}
-		if e == nil && !exist {
-			// Additional record OPT in the request was ensured, and in normal case the resp should also set it.
-			// This DNS packet may be a rush-answer, and we should reject it.
-			c.log.WithFields(logrus.Fields{
-				"ques":     q,
-				"addition": FormatDnsRsc(msg.Additionals),
-				"ans":      FormatDnsRsc(msg.Answers),
-			}).Traceln("DNS rush-answer detected")
-			return nil, SuspectedRushAnswerError
-		}
-	}
-
-	// Update DnsCache.
-	if err = c.updateDnsCache(&msg, ttl, &q); err != nil {
-		return nil, err
-	}
-	// Pack to get newData.
-	return &msg, nil
-}
-
 func (c *DnsController) updateDnsCache(msg *dnsmessage.Message, ttl uint32, q *dnsmessage.Question) error {
 	// Update DnsCache.
 	if c.log.IsLevelEnabled(logrus.TraceLevel) {
@@ -350,29 +253,87 @@ func (c *DnsController) UpdateDnsCacheTtl(host string, dnsTyp string, answers []
 	})
 }
 
-func (c *DnsController) DnsRespHandlerFactory(validateRushAnsFunc func(from netip.AddrPort) bool) func(data []byte, from netip.AddrPort) (msg *dnsmessage.Message, err error) {
-	return func(data []byte, from netip.AddrPort) (msg *dnsmessage.Message, err error) {
-		// Do not return conn-unrelated err in this func.
+func (c *DnsController) DnsRespHandlerFactory() func(data []byte, from netip.AddrPort) (msg *dnsmessage.Message, updateCache func() error, err error) {
+	return func(data []byte, from netip.AddrPort) (*dnsmessage.Message, func() error, error) {
+		var msg dnsmessage.Message
+		var err error
+		dummyUpdateCache := func() error { return nil }
+		if err = msg.Unpack(data); err != nil {
+			return nil, nil, fmt.Errorf("unpack dns pkt: %w", err)
+		}
+		// Check healthy resp.
+		if !msg.Response || len(msg.Questions) == 0 {
+			return &msg, dummyUpdateCache, nil
+		}
 
-		validateRushAns := validateRushAnsFunc(from)
-		msg, err = c.DnsRespHandler(data, validateRushAns)
-		if err != nil {
-			if errors.Is(err, SuspectedRushAnswerError) {
-				if validateRushAns {
-					// Reject DNS rush-answer.
-					c.log.WithFields(logrus.Fields{
-						"from": from,
-					}).Tracef("DNS rush-answer rejected")
-					return nil, nil
-				}
-			} else {
-				if c.log.IsLevelEnabled(logrus.DebugLevel) {
-					c.log.Debugf("DnsRespHandler: %v", err)
-				}
-				return nil, err
+		q := msg.Questions[0]
+
+		// Check suc resp.
+		if msg.RCode != dnsmessage.RCodeSuccess {
+			return &msg, dummyUpdateCache, nil
+		}
+
+		// Get TTL.
+		var ttl uint32
+		for i := range msg.Answers {
+			if ttl == 0 {
+				ttl = msg.Answers[i].Header.TTL
+				break
 			}
 		}
-		return msg, nil
+		if ttl == 0 {
+			// It seems no answers (NXDomain).
+			ttl = minFirefoxCacheTtl
+		}
+
+		// Check req type.
+		switch q.Type {
+		case dnsmessage.TypeA, dnsmessage.TypeAAAA:
+		default:
+			return &msg, func() error {
+				// Update DnsCache.
+				if err = c.updateDnsCache(&msg, ttl, &q); err != nil {
+					return err
+				}
+				return nil
+			}, nil
+		}
+
+		// Set ttl.
+		for i := range msg.Answers {
+			// Set TTL = zero. This requests applications must resend every request.
+			// However, it may be not defined in the standard.
+			msg.Answers[i].Header.TTL = 0
+		}
+
+		// Check if request A/AAAA record.
+		var reqIpRecord bool
+	loop:
+		for i := range msg.Questions {
+			switch msg.Questions[i].Type {
+			case dnsmessage.TypeA, dnsmessage.TypeAAAA:
+				reqIpRecord = true
+				break loop
+			}
+		}
+		if !reqIpRecord {
+			return &msg, func() error {
+				// Update DnsCache.
+				if err = c.updateDnsCache(&msg, ttl, &q); err != nil {
+					return err
+				}
+				return nil
+			}, nil
+		}
+
+		// Pack to get newData.
+		return &msg, func() error {
+			// Update DnsCache.
+			if err = c.updateDnsCache(&msg, ttl, &q); err != nil {
+				return err
+			}
+			return nil
+		}, nil
 	}
 }
 
@@ -545,29 +506,7 @@ func (c *DnsController) handle_(
 func (c *DnsController) sendReject_(dnsMessage *dnsmessage.Message, req *udpRequest) (err error) {
 	dnsMessage.Answers = nil
 	if len(dnsMessage.Questions) > 0 {
-		q := dnsMessage.Questions[0]
-		switch typ := q.Type; typ {
-		case dnsmessage.TypeA:
-			dnsMessage.Answers = []dnsmessage.Resource{{
-				Header: dnsmessage.ResourceHeader{
-					Name:  q.Name,
-					Type:  typ,
-					Class: dnsmessage.ClassINET,
-					TTL:   0,
-				},
-				Body: &dnsmessage.AResource{A: UnspecifiedAddressA.As4()},
-			}}
-		case dnsmessage.TypeAAAA:
-			dnsMessage.Answers = []dnsmessage.Resource{{
-				Header: dnsmessage.ResourceHeader{
-					Name:  q.Name,
-					Type:  typ,
-					Class: dnsmessage.ClassINET,
-					TTL:   0,
-				},
-				Body: &dnsmessage.AAAAResource{AAAA: UnspecifiedAddressAAAA.As16()},
-			}}
-		}
+		dnsMessage.Answers = nil
 	}
 	dnsMessage.RCode = dnsmessage.RCodeSuccess
 	dnsMessage.Response = true
@@ -627,21 +566,10 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 	}
 
 	// dnsRespHandler caches dns response and check rush answers.
-	dnsRespHandler := c.DnsRespHandlerFactory(func(from netip.AddrPort) bool {
-		//// NOTICE: Rush-answer detector was removed because it does not always work in all districts.
-		//// We only validate rush-ans when outbound is direct and pkt does not send to a home device.
-		//// Because additional record OPT may not be supported by home router.
-		//// So se should trust home devices even if they make rush-answer (or looks like).
-		//return dialArgument.bestDialer.Property().Name == "direct" &&
-		//	!from.Addr().IsPrivate() &&
-		//	!from.Addr().IsLoopback() &&
-		//	!from.Addr().IsUnspecified()
-
-		// Do not validate rush-answer.
-		return false
-	})
+	dnsRespHandler := c.DnsRespHandlerFactory()
 	// Dial and send.
 	var respMsg *dnsmessage.Message
+	var updateCache func() error
 	// defer in a recursive call will delay Close(), thus we Close() before
 	// the next recursive call. However, a connection cannot be closed twice.
 	// We should set a connClosed flag to avoid it.
@@ -703,7 +631,7 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 			if err != nil {
 				return fmt.Errorf("failed to read from: %v (dialer: %v): %w", dialArgument.bestTarget, dialArgument.bestDialer.Property().Name, err)
 			}
-			respMsg, err = dnsRespHandler(respBuf[:n], dialArgument.bestTarget)
+			respMsg, updateCache, err = dnsRespHandler(respBuf[:n], dialArgument.bestTarget)
 			if err != nil {
 				return err
 			}
@@ -753,7 +681,7 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 		if n, err = io.ReadFull(conn, buf[:respLen]); err != nil {
 			return fmt.Errorf("failed to read DNS resp payload: %w", err)
 		}
-		respMsg, err = dnsRespHandler(buf[:n], dialArgument.bestTarget)
+		respMsg, updateCache, err = dnsRespHandler(buf[:n], dialArgument.bestTarget)
 		if respMsg == nil && err == nil {
 			err = fmt.Errorf("bad DNS response")
 		}
@@ -773,6 +701,9 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 	if err != nil {
 		return err
 	}
+
+	respMsg.ID = id
+
 	switch upstreamIndex {
 	case consts.DnsResponseOutboundIndex_Accept:
 		// Accept.
@@ -782,14 +713,53 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 				"upstream": upstreamName,
 			}).Traceln("Accept")
 		}
+
+		if c.log.IsLevelEnabled(logrus.InfoLevel) {
+			var qname, qtype string
+			if len(respMsg.Questions) > 0 {
+				q := respMsg.Questions[0]
+				qname = strings.ToLower(q.Name.String())
+				qtype = q.Type.String()
+			}
+			fields := logrus.Fields{
+				"network":  networkType.String(),
+				"outbound": dialArgument.bestOutbound.Name,
+				"policy":   dialArgument.bestOutbound.GetSelectionPolicy(),
+				"dialer":   dialArgument.bestDialer.Property().Name,
+				"_qname":   qname,
+				"qtype":    qtype,
+				"pid":      req.routingResult.Pid,
+				"pname":    ProcessName2String(req.routingResult.Pname[:]),
+				"mac":      Mac2String(req.routingResult.Mac[:]),
+			}
+			c.log.WithFields(fields).Infof("%v <-> %v", RefineSourceToShow(req.realSrc, req.realDst.Addr(), req.lanWanFlag), RefineAddrPortToShow(dialArgument.bestTarget))
+		}
+		// Keep the id the same with request.
+		data, err = respMsg.Pack()
+		if err != nil {
+			return err
+		}
+		if needResp {
+			if err = sendPkt(data, req.realDst, req.realSrc, req.src, req.lConn, req.lanWanFlag); err != nil {
+				return err
+			}
+		}
+		if err = updateCache(); err != nil {
+			return err
+		}
+		return nil
 	case consts.DnsResponseOutboundIndex_Reject:
 		// Reject the request with empty answer.
-		respMsg.Answers = nil
-		if c.log.IsLevelEnabled(logrus.TraceLevel) {
+		if c.log.IsLevelEnabled(logrus.InfoLevel) {
 			c.log.WithFields(logrus.Fields{
 				"question": respMsg.Questions,
 				"upstream": upstreamName,
-			}).Traceln("Reject with empty answer")
+			}).Infoln("Reject with empty answer")
+		}
+		if needResp {
+			return c.sendReject_(respMsg, req)
+		} else {
+			return nil
 		}
 	default:
 		if c.log.IsLevelEnabled(logrus.TraceLevel) {
@@ -801,43 +771,4 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 		}
 		return c.dialSend(invokingDepth+1, req, data, id, nextUpstream, needResp)
 	}
-	if upstreamIndex.IsReserved() && c.log.IsLevelEnabled(logrus.InfoLevel) {
-		var qname, qtype string
-		if len(respMsg.Questions) > 0 {
-			q := respMsg.Questions[0]
-			qname = strings.ToLower(q.Name.String())
-			qtype = q.Type.String()
-		}
-		fields := logrus.Fields{
-			"network":  networkType.String(),
-			"outbound": dialArgument.bestOutbound.Name,
-			"policy":   dialArgument.bestOutbound.GetSelectionPolicy(),
-			"dialer":   dialArgument.bestDialer.Property().Name,
-			"_qname":   qname,
-			"qtype":    qtype,
-			"pid":      req.routingResult.Pid,
-			"pname":    ProcessName2String(req.routingResult.Pname[:]),
-			"mac":      Mac2String(req.routingResult.Mac[:]),
-		}
-		switch upstreamIndex {
-		case consts.DnsResponseOutboundIndex_Accept:
-			c.log.WithFields(fields).Infof("%v <-> %v", RefineSourceToShow(req.realSrc, req.realDst.Addr(), req.lanWanFlag), RefineAddrPortToShow(dialArgument.bestTarget))
-		case consts.DnsResponseOutboundIndex_Reject:
-			c.log.WithFields(fields).Infof("%v -> reject", RefineSourceToShow(req.realSrc, req.realDst.Addr(), req.lanWanFlag))
-		default:
-			return fmt.Errorf("unknown upstream: %v", upstreamIndex.String())
-		}
-	}
-	// Keep the id the same with request.
-	respMsg.ID = id
-	data, err = respMsg.Pack()
-	if err != nil {
-		return err
-	}
-	if needResp {
-		if err = sendPkt(data, req.realDst, req.realSrc, req.src, req.lConn, req.lanWanFlag); err != nil {
-			return err
-		}
-	}
-	return nil
 }

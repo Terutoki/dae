@@ -46,13 +46,13 @@ func FlipDnsQuestionCase(dm *dnsmessage.Message) {
 func EnsureAdditionalOpt(dm *dnsmessage.Message, isReqAdd bool) (bool, error) {
 	// Check healthy resp.
 	if isReqAdd == dm.Response || dm.RCode != dnsmessage.RCodeSuccess || len(dm.Questions) == 0 {
-		return false, UnsupportedQuestionTypeError
+		return false, ErrUnsupportedQuestionType
 	}
 	q := dm.Questions[0]
 	switch q.Type {
 	case dnsmessage.TypeA, dnsmessage.TypeAAAA:
 	default:
-		return false, UnsupportedQuestionTypeError
+		return false, ErrUnsupportedQuestionType
 	}
 
 	for _, ad := range dm.Additionals {
